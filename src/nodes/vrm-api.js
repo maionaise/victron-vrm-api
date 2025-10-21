@@ -63,7 +63,7 @@ module.exports = function (RED) {
                 options.parameters = buildStatsParameters(config)
               }
 
-              result = await apiService.callInstallationsAPI(siteId, config.installations, 'GET', null, options)
+              result = await apiService.callInstallationsAPI(siteId, config.installations, 'GET', msg.payload, options)
               msg.topic = `installations ${config.installations}`
               break
             }
@@ -105,6 +105,10 @@ module.exports = function (RED) {
               statusInfo = apiService.interpretUsersStatus(result.data, config.users)
             } else if (config.installations === 'stats' && result.data) {
               statusInfo = apiService.interpretStatsStatus(result.data)
+              if (config.attribute === 'dynamic_ess') {
+                statusInfo.text = statusInfo.text + ' (deprecated)'
+                statusInfo.color = 'yellow'
+              }
             } else if (config.installations === 'dynamic-ess-settings' && result.data) {
               statusInfo = apiService.interpretDynamicEssStatus(result.data)
             } else if (config.api_type === 'widgets' && result.data) {
