@@ -15,6 +15,10 @@ function buildStatsParameters (config) {
     }
   } else {
     parameters.type = config.attribute
+    // Default interval for dynamic_ess
+    if (!config.stats_interval && !config.interval) {
+      parameters.interval = 'hours'
+    }
   }
 
   // Add interval for all types (including dynamic_ess)
@@ -25,15 +29,6 @@ function buildStatsParameters (config) {
   if (config.attribute === 'evcs') {
     delete parameters['attributeCodes[]']
     parameters.type = 'evcs'
-  }
-
-  // BACKWARD COMPATIBILITY FIX FOR DEPRECATED dynamic_ess STATS ENDPOINT:
-  // The VRM API behavior changed - the old API ignored the interval parameter and always
-  // returned hourly data. The new API respects the interval parameter.
-  // Users who had '15mins' configured were unknowingly getting hourly data (24 records).
-  // To maintain backward compatibility, force interval to 'hours' for dynamic_ess.
-  if (config.attribute === 'dynamic_ess') {
-    parameters.interval = 'hours'
   }
 
   // Handle time parameters
@@ -57,10 +52,10 @@ function buildStatsParameters (config) {
   }
 
   // Set start time
-  if (config.stats_start) {      // interpret 'now', 'boy' 'bod' and 'bot'
+  if (config.stats_start) { // interpret 'now', 'boy' 'bod' and 'bot'
     if (config.stats_start === 'now') {
       parameters.start = floorToHour(nowTs)
-    } else if (config.stats_start === 'boy' ) {
+    } else if (config.stats_start === 'boy') {
       const yesterday = new Date(now)
       yesterday.setDate(yesterday.getDate() - 1)
       parameters.start = getStartOfDay(yesterday)
@@ -72,12 +67,12 @@ function buildStatsParameters (config) {
       parameters.start = getStartOfDay(tomorrow)
     } else if (!isNaN(parseInt(config.stats_start))) {
       // the value is an offset in seconds from now
-      parameters.start = floorToHour(nowTs - parseInt(config.stats_start))
+      parameters.start = floorToHour(nowTs + parseInt(config.stats_start))
     }
   }
 
   // Set end time
-  if (config.stats_end) {      // interpret 'eod', 'eoy', 'eot', and 'eoyr'
+  if (config.stats_end) { // interpret 'eod', 'eoy', 'eot', and 'eoyr'
     if (config.stats_end === 'eod') {
       const endOfDay = new Date(now)
       // Set to start of next day (24:00:00 = 00:00:00 + 1 day) for API preference

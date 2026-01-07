@@ -1,9 +1,10 @@
 'use strict'
 
 const axios = require('axios')
+const http = require('http')
+const https = require('https')
 const debug = require('debug')('victron-vrm-api:service')
 const path = require('path')
-const { buildStatsParameters } = require('../utils/stats-parameters')
 
 // Get package version for User-Agent
 const packageJson = require(path.join(__dirname, '../../', 'package.json'))
@@ -17,6 +18,14 @@ class VRMAPIService {
     this.baseUrl = options.baseUrl || 'https://vrmapi.victronenergy.com/v2'
     this.dynamicEssUrl = options.dynamicEssUrl || 'https://vrm-dynamic-ess-api.victronenergy.com'
     this.userAgent = options.userAgent || `nrc-vrm-api/${packageJson.version}`
+    this.forceIpv4 = options.forceIpv4 || false
+
+    // Configure axios to force IPv4 if requested
+    if (this.forceIpv4) {
+      debug('Configuring axios to force IPv4 connections')
+      axios.defaults.httpAgent = new http.Agent({ family: 4 })
+      axios.defaults.httpsAgent = new https.Agent({ family: 4 })
+    }
   }
 
   /**
@@ -47,35 +56,39 @@ class VRMAPIService {
       actualEndpoint = 'dynamic-ess-settings'
       actualMethod = 'patch'
     } else if (endpoint === 'fetch-dynamic-ess-schedules') {
-      actualEndpoint = 'stats'
+      // NEW: Use the correct schedule-dynamic-ess endpoint
+      actualEndpoint = 'schedule-dynamic-ess'
       actualMethod = 'get'
-
-      // Create a config object for buildStatsParameters
-      const statsConfig = {
-        attribute: 'dynamic_ess',
-        interval: '15mins', // Always query for 15 minute buckets
-        stats_start: 'bod', // beginning of day
-        stats_end: 'eot', // end of tomorrow - Dynamic ESS schedules typically span current day + next day
-        use_utc: true
-      }
-
-      // Use buildStatsParameters to properly handle time calculations
-      options.parameters = buildStatsParameters(statsConfig)
+      // This endpoint doesn't need the complex stats parameters
+      // It just needs async=0
+      options.parameters = { async: 0 }
     }
 
     url += `/${actualEndpoint}`
 
-    // Add query parameters for stats endpoint
+    // Add query parameters based on endpoint type
+    let queryParams = null
+
     if (actualEndpoint === 'stats' && options.parameters) {
-      const params = new URLSearchParams()
+      // Handle stats endpoint parameters
+      queryParams = new URLSearchParams()
       Object.entries(options.parameters).forEach(([key, value]) => {
         if (Array.isArray(value)) {
-          value.forEach(v => params.append(key, v))
+          value.forEach(v => queryParams.append(key, v))
         } else {
-          params.append(key, value)
+          queryParams.append(key, value)
         }
       })
-      const queryString = params.toString()
+    } else if (actualEndpoint === 'schedule-dynamic-ess' && options.parameters) {
+      // Handle schedule-dynamic-ess endpoint parameters
+      queryParams = new URLSearchParams()
+      Object.entries(options.parameters).forEach(([key, value]) => {
+        queryParams.append(key, value)
+      })
+    }
+
+    if (queryParams) {
+      const queryString = queryParams.toString()
       if (queryString) {
         url += `?${queryString}`
       }
@@ -149,6 +162,8 @@ class VRMAPIService {
       }
     } else if (endpoint === 'me') {
       url += '/me'
+    } else {
+      throw new Error(`Unknown users endpoint: ${endpoint}`)
     }
 
     const headers = this._buildHeaders()
@@ -157,6 +172,7 @@ class VRMAPIService {
 
     try {
       const response = await axios.get(url, { headers })
+
       debug(`Response ${response.status}:`, response.data)
 
       return {
@@ -195,6 +211,7 @@ class VRMAPIService {
 
     try {
       const response = await axios.get(url, { headers })
+
       debug(`Response ${response.status}:`, response.data)
 
       return {
@@ -213,6 +230,51 @@ class VRMAPIService {
         error: error.message,
         url,
         method: 'get'
+      }
+    }
+  }
+
+  /**
+   * Generic method to make custom API calls (for advanced usage)
+   */
+  async makeCustomCall (url, method = 'GET', payload = null, customHeaders = {}) {
+    const headers = this._buildHeaders(customHeaders)
+
+    debug(`${method.toUpperCase()} ${url}`, payload ? { payload } : '')
+
+    try {
+      let response
+      switch (method.toLowerCase()) {
+        case 'get':
+          response = await axios.get(url, { headers })
+          break
+        case 'post':
+          response = await axios.post(url, payload, { headers })
+          break
+        case 'patch':
+          response = await axios.patch(url, payload, { headers })
+          break
+        default:
+          throw new Error(`Unsupported method: ${method}`)
+      }
+
+      debug(`Response ${response.status}:`, response.data)
+      return {
+        success: true,
+        status: response.status,
+        data: response.data,
+        url,
+        method: method.toLowerCase()
+      }
+    } catch (error) {
+      debug('API Error:', error.response?.status, error.response?.data)
+      return {
+        success: false,
+        status: error.response?.status,
+        data: error.response?.data,
+        error: error.message,
+        url,
+        method: method.toLowerCase()
       }
     }
   }
@@ -239,7 +301,6 @@ class VRMAPIService {
 
   /**
    * Interpret users API response for status display
-   * Returns formatted status information for users data
    */
   interpretUsersStatus (responseData, endpoint) {
     if (!responseData) {
@@ -306,20 +367,45 @@ class VRMAPIService {
   }
 
   /**
-   * Interpret Dynamic ESS settings response for status display
-   * Returns structured status information that can be used by any consumer
-   *
-   * Dynamic ESS API returns data in this structure:
-   * {
-   *   "success": true,
-   *   "data": {
-   *     "idSite": 102195,
-   *     "isGreenModeOn": true,
-   *     "mode": 1,
-   *     "operatingMode": 1,
-   *     // ... many other fields
-   *   }
-   * }
+   * Interpret stats API response for status display
+   */
+  interpretStatsStatus (responseData) {
+    if (!responseData || !responseData.totals) {
+      return {
+        text: 'No stats data',
+        color: 'yellow',
+        totals: null,
+        raw: responseData
+      }
+    }
+
+    const key = Object.keys(responseData.totals)[0]
+    if (!key) {
+      return {
+        text: 'No totals',
+        color: 'yellow',
+        totals: responseData.totals,
+        raw: responseData
+      }
+    }
+
+    const value = responseData.totals[key]
+    const formatNumber = (value) => typeof value === 'number' ? value.toFixed(1) : value
+    const text = `${key.replace(/_/g, ' ')}: ${formatNumber(value)}`
+
+    return {
+      text,
+      color: 'green',
+      key,
+      value,
+      formattedValue: formatNumber(value),
+      totals: responseData.totals,
+      raw: responseData
+    }
+  }
+
+  /**
+   * Interpret dynamic ESS settings response for status display
    */
   interpretDynamicEssStatus (responseData) {
     const data = responseData?.data
@@ -366,48 +452,8 @@ class VRMAPIService {
   }
 
   /**
-   * Interpret stats response for status display
-   * Returns formatted status information for stats data
+   * Interpret widgets API response for status display
    */
-  interpretStatsStatus (responseData) {
-    if (!responseData || !responseData.totals) {
-      return {
-        text: 'No stats data',
-        color: 'yellow',
-        totals: null,
-        raw: responseData
-      }
-    }
-
-    const key = Object.keys(responseData.totals)[0]
-    if (!key) {
-      return {
-        text: 'No totals',
-        color: 'yellow',
-        totals: responseData.totals,
-        raw: responseData
-      }
-    }
-
-    const value = responseData.totals[key]
-    const formatNumber = (value) => typeof value === 'number' ? value.toFixed(1) : value
-    const text = `${key.replace(/_/g, ' ')}: ${formatNumber(value)}`
-
-    return {
-      text,
-      color: 'green',
-      key,
-      value,
-      formattedValue: formatNumber(value),
-      totals: responseData.totals,
-      raw: responseData
-    }
-  }
-
-  /**
- * Interpret widgets API response for status display
- * Returns formatted status information for widgets data
- */
   interpretWidgetsStatus (responseData, widgetType, instance) {
     if (!responseData?.records?.data) {
       return {
@@ -553,51 +599,6 @@ class VRMAPIService {
       hasData: true,
       instance,
       raw: responseData
-    }
-  }
-
-  /**
-   * Generic method to make custom API calls (for advanced usage)
-   */
-  async makeCustomCall (url, method = 'GET', payload = null, customHeaders = {}) {
-    const headers = this._buildHeaders(customHeaders)
-
-    debug(`${method.toUpperCase()} ${url}`, payload ? { payload } : '')
-
-    try {
-      let response
-      switch (method.toLowerCase()) {
-        case 'get':
-          response = await axios.get(url, { headers })
-          break
-        case 'post':
-          response = await axios.post(url, payload, { headers })
-          break
-        case 'patch':
-          response = await axios.patch(url, payload, { headers })
-          break
-        default:
-          throw new Error(`Unsupported method: ${method}`)
-      }
-
-      debug(`Response ${response.status}:`, response.data)
-      return {
-        success: true,
-        status: response.status,
-        data: response.data,
-        url,
-        method: method.toLowerCase()
-      }
-    } catch (error) {
-      debug('API Error:', error.response?.status, error.response?.data)
-      return {
-        success: false,
-        status: error.response?.status,
-        data: error.response?.data,
-        error: error.message,
-        url,
-        method: method.toLowerCase()
-      }
     }
   }
 }

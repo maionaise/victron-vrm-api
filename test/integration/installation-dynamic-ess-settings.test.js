@@ -6,6 +6,7 @@ require('dotenv').config()
 
 xdescribe('VRM API Integration - Dynamic ESS Settings PATCH Bug Detection', () => {
   let apiService
+  let siteId
 
   // Skip integration tests if credentials are not available
   const skipIfNoCredentials = () => {
@@ -21,6 +22,7 @@ xdescribe('VRM API Integration - Dynamic ESS Settings PATCH Bug Detection', () =
     if (skipIfNoCredentials()) return
 
     apiService = new VRMAPIService(process.env.VRM_API_TOKEN)
+    siteId = process.env.VRM_TEST_SITE_ID
   })
 
   describe('Environment Setup', () => {
@@ -36,8 +38,6 @@ xdescribe('VRM API Integration - Dynamic ESS Settings PATCH Bug Detection', () =
   })
 
   describe('Dynamic ESS Settings - Basic Operations', () => {
-    const siteId = process.env.VRM_TEST_SITE_ID
-
     it('should format status display correctly for different modes', async () => {
       if (skipIfNoCredentials()) return
 
@@ -165,7 +165,7 @@ xdescribe('VRM API Integration - Dynamic ESS Settings PATCH Bug Detection', () =
       expect(patchResult.data.data.isGreenModeOn).toBe(!currentGreenMode)
     } else {
       console.log(`   Error: ${patchResult.error}`)
-      console.log(`   Response data:`, patchResult.data)
+      console.log('   Response data:', patchResult.data)
     }
 
     // Important: Patch back to original value to avoid affecting other tests

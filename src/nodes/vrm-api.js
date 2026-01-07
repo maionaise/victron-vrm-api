@@ -5,6 +5,8 @@ module.exports = function (RED) {
   const { buildStatsParameters } = require('../utils/stats-parameters')
   const debug = require('debug')('victron-vrm-api')
 
+  const { transformPriceSchedule } = require('../utils/price-schedule-transformer')
+
   function VRMAPI (config) {
     RED.nodes.createNode(this, config)
     debug('VRMAPI node created with config:', config)
@@ -12,6 +14,12 @@ module.exports = function (RED) {
     this.vrm = RED.nodes.getNode(config.vrm)
     const node = this
     node.lastValidUpdate = null
+
+    const isDynamicESS = config.installations === 'fetch-dynamic-ess-schedules'
+    if (isDynamicESS && config.transform_price_schedule) {
+      // When transform is enabled, we have 2 outputs
+      // This doesn't actually change the node, but documents the intent
+    }
 
     node.on('input', async function (msg) {
       const currentTime = Date.now()
@@ -31,6 +39,12 @@ module.exports = function (RED) {
         return
       }
 
+      // Initialize API service with IPv4 configuration if available
+      const serviceOptions = {}
+      if (this.vrm && this.vrm.forceIpv4) {
+        serviceOptions.forceIpv4 = true
+      }
+
       // Initialize API service
       const apiService = new VRMAPIService(apiToken)
 
@@ -48,8 +62,10 @@ module.exports = function (RED) {
           // Handle standard API types
           switch (config.api_type) {
             case 'users': {
-              result = await apiService.callUsersAPI(config.users, config.idUser)
-              msg.topic = `users ${config.users}`
+              // Backwards compatibility: fallback to 'users' field for old flows
+              const usersQuery = config.usersQuery || config.users || 'me'
+              result = await apiService.callUsersAPI(usersQuery, config.idUser)
+              msg.topic = `users ${usersQuery}`
               break
             }
 
@@ -86,7 +102,14 @@ module.exports = function (RED) {
 
         // Handle the response
         if (result.success) {
-          msg.payload = result.data
+          const messages = [null, null]
+
+          // Output 1: Raw data (always sent)
+          // Clone the original message to preserve HTTP context and custom properties
+          messages[0] = RED.util.cloneMessage(msg)
+          messages[0].payload = result.data
+          messages[0].topic = msg.topic
+          messages[0].url = result.url
 
           // Store in global context if requested
           if (config.store_in_global_context === true) {
@@ -94,43 +117,61 @@ module.exports = function (RED) {
             globalContext.set(msg.topic.split(' ').join('.'), result.data)
           }
 
-          // Set status based on response
-          if (result.data && result.data.success === false) {
-            node.status({ fill: 'yellow', shape: 'dot', text: result.data.error_code })
-          } else {
-            let statusInfo = { text: 'Ok', color: 'green' }
+          // Check if we should transform price schedule
+          const shouldTransform = config.transform_price_schedule &&
+                                  config.installations === 'stats' &&
+                                  config.attribute === 'dynamic_ess'
 
-            // Use service methods to interpret different response types
-            if (config.api_type === 'users' && result.data) {
-              statusInfo = apiService.interpretUsersStatus(result.data, config.users)
-            } else if (config.installations === 'stats' && result.data) {
-              statusInfo = apiService.interpretStatsStatus(result.data)
-              if (config.attribute === 'dynamic_ess') {
-                statusInfo.text = statusInfo.text + ' (deprecated)'
-                statusInfo.color = 'yellow'
-              }
-            } else if (config.installations === 'dynamic-ess-settings' && result.data) {
-              statusInfo = apiService.interpretDynamicEssStatus(result.data)
-            } else if (config.api_type === 'widgets' && result.data) {
-              statusInfo = apiService.interpretWidgetsStatus(result.data, config.widgets, config.instance)
+          if (shouldTransform) {
+            // Output 2: Transformed price schedule
+            try {
+              const transformed = transformPriceSchedule(result.data.records || result.data)
+
+              // Clone the original message for output 2 as well
+              messages[1] = RED.util.cloneMessage(msg)
+              messages[1].payload = transformed.payload
+              messages[1].metadata = transformed.metadata
+              messages[1].topic = 'price-schedule'
+
+              node.status({
+                fill: 'green',
+                shape: 'dot',
+                text: `${transformed.metadata.count} price intervals`
+              })
+            } catch (err) {
+              node.warn('Failed to transform price schedule: ' + err.message)
+              node.status({
+                fill: 'yellow',
+                shape: 'ring',
+                text: 'transform error'
+              })
             }
+          } else {
+            // Set status based on response (existing logic)
+            if (result.data && result.data.success === false) {
+              node.status({ fill: 'yellow', shape: 'dot', text: result.data.error_code })
+            } else {
+              let statusInfo = { text: 'Ok', color: 'green' }
 
-            node.status({ fill: statusInfo.color, shape: 'dot', text: statusInfo.text })
+              // Use service methods to interpret different response types
+              if (config.api_type === 'users' && result.data) {
+                // Backwards compatibility: fallback to 'users' field for old flows
+                const usersQuery = config.usersQuery || config.users || 'me'
+                statusInfo = apiService.interpretUsersStatus(result.data, usersQuery)
+              } else if (config.installations === 'stats' && result.data) {
+                statusInfo = apiService.interpretStatsStatus(result.data)
+              } else if (config.installations === 'dynamic-ess-settings' && result.data) {
+                statusInfo = apiService.interpretDynamicEssStatus(result.data)
+              } else if (config.api_type === 'widgets' && result.data) {
+                statusInfo = apiService.interpretWidgetsStatus(result.data, config.widgets, config.instance)
+              }
+
+              node.status({ fill: statusInfo.color, shape: 'dot', text: statusInfo.text })
+            }
           }
 
           node.lastValidUpdate = currentTime
-          node.send(msg)
-        } else {
-          // Handle API errors
-          if (result.data && result.data.errors) {
-            node.status({ fill: 'red', shape: 'dot', text: result.data.errors })
-          } else {
-            node.status({ fill: 'red', shape: 'dot', text: result.error || 'Error fetching VRM data' })
-          }
-
-          // Send error response
-          msg.payload = result
-          node.send(msg)
+          node.send(messages)
         }
 
         // Verbose logging
